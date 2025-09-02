@@ -89,4 +89,3 @@ async def resetcount_cmd(interaction: discord.Interaction):
 
 if __name__ == "__main__":
     bot.run(TOKEN)
-
