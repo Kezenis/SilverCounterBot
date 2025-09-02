@@ -2,58 +2,74 @@ import os
 import discord
 from discord.ext import commands
 from discord import app_commands
-import aiosqlite
+import asyncpg
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
-    raise SystemExit("No DISCORD_TOKEN found. Did you set it in Railway Variables?")
+    raise SystemExit("No DISCORD_TOKEN found. Set it in Railway → Variables.")
 
-DB_PATH = "counter.db"
-GLOBAL_KEY = "global"
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise SystemExit("No DATABASE_URL found. Add Railway PostgreSQL and ensure the var is present.")
 
-intents = discord.Intents.none()
-bot = commands.Bot(command_prefix="!", intents=intents)
+GLOBAL_KEY = "global"  # change to per-guild/channel later if you want
+_pg_pool = None
+
+async def get_pool():
+    global _pg_pool
+    if _pg_pool is None:
+        # asyncpg understands sslmode=require in the URL from Railway
+        _pg_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=3)
+    return _pg_pool
 
 # --- DB helpers ---
 async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS counters (
-                key TEXT PRIMARY KEY,
-                value INTEGER NOT NULL
-            )
+    pool = await get_pool()
+    async with pool.acquire() as con:
+        await con.execute("""
+            CREATE TABLE IF NOT EXISTS counters(
+              key   TEXT PRIMARY KEY,
+              value INTEGER NOT NULL
+            );
         """)
-        await db.execute("INSERT OR IGNORE INTO counters(key, value) VALUES (?, 0)", (GLOBAL_KEY,))
-        await db.commit()
+        await con.execute("""
+            INSERT INTO counters(key, value) VALUES($1, 0)
+            ON CONFLICT (key) DO NOTHING;
+        """, GLOBAL_KEY)
 
 async def get_count(key: str = GLOBAL_KEY) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT value FROM counters WHERE key = ?", (key,)) as cur:
-            row = await cur.fetchone()
-            return row[0] if row else 0
+    pool = await get_pool()
+    async with pool.acquire() as con:
+        row = await con.fetchrow("SELECT value FROM counters WHERE key=$1", key)
+        return int(row["value"]) if row else 0
 
 async def add_count(delta: int, key: str = GLOBAL_KEY) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            INSERT INTO counters(key, value) VALUES(?, ?)
-            ON CONFLICT(key) DO UPDATE SET value = counters.value + excluded.value
-        """, (key, delta))
-        await db.commit()
-        return await get_count(key)
+    pool = await get_pool()
+    async with pool.acquire() as con:
+        await con.execute("""
+            INSERT INTO counters(key, value) VALUES($1, $2)
+            ON CONFLICT (key) DO UPDATE SET value = counters.value + EXCLUDED.value;
+        """, key, delta)
+        row = await con.fetchrow("SELECT value FROM counters WHERE key=$1", key)
+        return int(row["value"])
 
 async def set_count(value: int, key: str = GLOBAL_KEY) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            INSERT INTO counters(key, value) VALUES(?, ?)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value
-        """, (key, value))
-        await db.commit()
-        return await get_count(key)
+    pool = await get_pool()
+    async with pool.acquire() as con:
+        await con.execute("""
+            INSERT INTO counters(key, value) VALUES($1, $2)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
+        """, key, value)
+        row = await con.fetchrow("SELECT value FROM counters WHERE key=$1", key)
+        return int(row["value"])
 
 async def reset_count(key: str = GLOBAL_KEY) -> int:
     return await set_count(0, key)
 
-# --- Slash commands ---
+# --- Bot setup & slash commands ---
+intents = discord.Intents.none()
+bot = commands.Bot(command_prefix="!", intents=intents)
+
 @bot.event
 async def on_ready():
     await init_db()
